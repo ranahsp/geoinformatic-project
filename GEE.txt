@@ -1,0 +1,153 @@
+var roi = ee.Geometry.Polygon([
+  [[-4.2, 41.5], [-4.2, 41.7], [-4.0, 41.7], [-4.0, 41.5], [-4.2, 41.5]]
+]);
+
+var start_date = '2022-07-18';
+var end_date = '2022-07-19';
+
+var s1_collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(roi)
+  .filterDate(start_date, end_date)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .select(['VV', 'VH', 'angle'])
+  .map(function(img) {
+    return img.clip(roi);
+  });
+print('Collection', s1_collection);
+
+var s1_collection_to_img = s1_collection.mosaic(); 
+var incidence_angle = s1_collection_to_img.select('angle'); 
+print('Incidence angle', incidence_angle);
+
+var sentinel1 = s1_collection_to_img.select(['VV', 'VH']); 
+Map.centerObject(roi, 9);
+Map.addLayer(sentinel1.select('VH'), {min: -25, max: 5}, 'Iinitial GRD Sentinel-1 VH');
+Map.addLayer(sentinel1.select('VV'), {min: -25, max: 5}, 'Iinitial GRD Sentinel-1 VV');
+
+
+print("Iinitial GRD Sentinel-1 Image:", sentinel1);
+
+//----------------------------check---------------------------------------------
+var rawStats = sentinel1.select('VH').reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: roi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+print('Iinitial GRD VH (dB) range Before Processing:', rawStats);
+
+var backscatter_power_bands = function(image){
+  var sigma0PowVV = ee.Image.constant(10).pow(image.select('VV').divide(10.0));
+  var sigma0PowVH = ee.Image.constant(10).pow(image.select('VH').divide(10.0));
+  
+  return image.addBands(sigma0PowVV.rename(['VV_pow'])).addBands(sigma0PowVH.rename(['VH_pow']));
+};
+
+var sentinel1 = backscatter_power_bands(sentinel1).select(['VV_pow', 'VH_pow']);
+
+
+
+// ------------------------speckle lee filter ------------------------
+var applyLeeFilter = function(image, boxSize) {
+  var float_img = image.toFloat();
+
+  var mean = float_img.reduceNeighborhood({
+    reducer: ee.Reducer.mean(),
+    kernel: ee.Kernel.square(boxSize, 'pixels')
+  });
+
+  var variance = float_img.reduceNeighborhood({
+    reducer: ee.Reducer.variance(),
+    kernel: ee.Kernel.square(boxSize, 'pixels')
+  });
+
+  var overallVariance = ee.Image.constant(
+    variance.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: roi,
+      scale: 10,
+      bestEffort: true
+    }).values().get(0)
+  );
+
+  var weights = variance.divide(variance.add(overallVariance));
+  var filtered_img = mean.add(weights.multiply(float_img.subtract(mean)));
+
+  var bandNames = image.bandNames();
+  var renamedBands = bandNames.map(function(name) {
+    return ee.String(name).cat('_lee');
+  });
+
+  return filtered_img.rename(renamedBands);
+};
+
+
+var leeWindowSize = 5;
+var sentinel1_lee = applyLeeFilter(sentinel1, leeWindowSize);
+
+Map.addLayer(sentinel1_lee.select('VH_pow_lee'), {min: -25, max: 0}, 'VH (pow) Lee Filtered');
+Map.addLayer(sentinel1_lee.select('VV_pow_lee'), {min: -25, max: 0}, 'VV (pow) Lee Filtered');
+print('Lee Filtered Sentinel-1:', sentinel1_lee);
+
+
+var terrain_flattening = function(image){
+
+  var theta_i = incidence_angle.select('angle');
+  var theta_iRad = theta_i.multiply(Math.PI / 180);
+
+  var gamma0VV = image.select('VV_pow_lee').divide(theta_iRad.cos());
+  var gamma0VH = image.select('VH_pow_lee').divide(theta_iRad.cos());
+
+  return image.addBands(gamma0VV.rename(['gamma_nought_VV_pow_lee'])).addBands(gamma0VH.rename(['gamma_nought_VH_pow_lee']));
+};
+
+var sentinel1_flattened = terrain_flattening(sentinel1_lee).select(['gamma_nought_VV_pow_lee', 'gamma_nought_VH_pow_lee']);
+print('Terrain Flattened Sentinel-1:', sentinel1_flattened);
+Map.addLayer(sentinel1_flattened.select('gamma_nought_VH_pow_lee'), {min: -25, max: 0}, 'VH (pow) Terrain Flattened');
+Map.addLayer(sentinel1_flattened.select('gamma_nought_VV_pow_lee'), {min: -25, max: 0}, 'VV (pow) Terrain Flattened');
+
+
+// --------------------------------------Check actual pixel range BEFORE dB-----------------------
+var vhStats = sentinel1_flattened.select('gamma_nought_VH_pow_lee').reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: roi,
+  scale: 10,
+  maxPixels: 1e13
+});
+print('Gamma nought GRD VH Range (pow):', vhStats);
+
+//---------------------------------------------------conversion to dB----------------------------------
+var add_dB_bands = function(image){
+  var gamma0dBVV = ee.Image.constant(10).multiply(image.select('gamma_nought_VV_pow_lee').log10());
+  var gamma0dBVH = ee.Image.constant(10).multiply(image.select('gamma_nought_VH_pow_lee').log10());
+  
+  return image.addBands(gamma0dBVV.rename(['gamma_nought_VV_lee_dB'])).addBands(gamma0dBVH.rename(['gamma_nought_VH_lee_dB']));
+};
+
+var sentinel1_dB = add_dB_bands(sentinel1_flattened).select(['gamma_nought_VV_lee_dB', 'gamma_nought_VH_lee_dB']);
+print('Gamma nought GRD Sentinel-1 image in dB:', sentinel1_dB);
+Map.addLayer(sentinel1_dB.select('gamma_nought_VH_lee_dB'), {min: -25, max: 5}, 'Final VH dB');
+Map.addLayer(sentinel1_dB.select('gamma_nought_VV_lee_dB'), {min: -25, max: 5}, 'Final VV dB');
+  
+var stats = sentinel1_dB.select('gamma_nought_VH_lee_dB').reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: roi,
+  scale: 10,
+  maxPixels: 1e13
+});
+print('VH dB Min/Max:', stats);
+
+
+Export.image.toDrive({
+  image: sentinel1_dB.select(['gamma_nought_VV_lee_dB', 'gamma_nought_VH_lee_dB']), 
+  description: 'Sentinel1_TerrainCorrected_Export', 
+  folder: 'GEE_Exports',    
+  fileNamePrefix: 'S1_20220715_terrain_filtered', 
+  region: roi,             
+  scale: 10,                
+  crs: 'EPSG:4326',        
+  maxPixels: 1e13           
+});
